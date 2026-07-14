@@ -179,3 +179,121 @@ Recorded client inputs are saved under `outputs/turn_inputs/`, and server reply 
 
 - See `docs/client-plan.md` for the Windows client implementation plan.
 - See `docs/milestone-01-offline-client-server-loop.md` for the first validated client/server voice loop milestone.
+- See `docs/milestone-02-streaming-half-duplex-loop.md` for the validated live streaming loop milestone.
+
+## Streaming Frame Upload Test
+
+This is the first Milestone 02 test. It only validates continuous PCM frame upload and server-side wav reconstruction. It does not run VAD, ASR, LLM, or TTS yet.
+
+Start the stream record server on Linux:
+
+```bash
+cd /home/xiezc/Auralis
+python auralis_lab/ws_stream_record_server.py --host 0.0.0.0 --port 8766
+```
+
+Run the Windows client:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8766 --seconds 10 --frame-ms 100 --blocksize-frames 0
+```
+
+The client opens the selected microphone at a supported source sample rate, converts channel 0 to continuous 16 kHz mono PCM16 frames, and sends those frames to the server. The server saves reconstructed wav files under `outputs/ws_stream_records/`.
+
+## Streaming VAD Endpoint Test
+
+This validates continuous stream segmentation before ASR/LLM/TTS are added.
+
+Start one VAD server on Linux:
+
+```bash
+cd /home/xiezc/Auralis
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine energy
+```
+
+FunASR FSMN-VAD and Silero VAD can also be selected:
+
+```bash
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine funasr_fsmn
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine silero
+python auralis_lab/ws_stream_vad_server.py --host 0.0.0.0 --port 8767 --vad-engine webrtc --webrtc-aggressiveness 2
+```
+
+Server-side VAD model files are expected under `models/vad/`:
+
+```text
+models/vad/funasr-fsmn-vad
+models/vad/silero-vad
+```
+
+WebRTC VAD has no model file and only needs the `webrtcvad` Python package.
+
+Run the Windows client:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8767 --seconds 30 --frame-ms 100 --blocksize-frames 0
+```
+
+Detected utterances are saved on the server under `outputs/ws_stream_utterances/`.
+
+## Streaming VAD + ASR Test
+
+This validates continuous stream segmentation plus ASR transcription. The client still only streams microphone frames and prints server events.
+
+Start the server on Linux:
+
+```bash
+cd /home/xiezc/Auralis
+python auralis_lab/ws_stream_asr_server.py --host 0.0.0.0 --port 8768 --vad-engine silero --asr-engine sherpa_onnx
+```
+
+Run the Windows client:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8768 --seconds 60 --frame-ms 100 --blocksize-frames 0
+```
+
+The client prints `utterance_saved`, `asr_result`, and `asr_filtered` events. Utterance wav files are saved on the server under `outputs/ws_stream_asr_utterances/`.
+
+## Streaming VAD + ASR + LLM Test
+
+This adds Qwen3 replies after valid ASR results. `asr_filtered` events do not enter the LLM stage.
+
+Start the server on Linux:
+
+```bash
+cd /home/xiezc/Auralis
+python auralis_lab/ws_stream_llm_server.py --host 0.0.0.0 --port 8769 --vad-engine silero --asr-engine sherpa_onnx --llm-model qwen3:8b
+```
+
+Run the Windows client:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8769 --seconds 90 --frame-ms 100 --blocksize-frames 0 --timeout 180
+```
+
+The client prints `asr_result`, `asr_filtered`, and `llm_result` events. A connection keeps the latest four user/assistant turns by default; add `--max-history-turns 0` to the server command for independent single-turn replies.
+
+## Streaming VAD + ASR + LLM + TTS Test
+
+This is the first full streaming voice loop. The server keeps Sherpa-ONNX ASR and CosyVoice loaded, then returns each synthesized WAV reply to the Windows client for playback.
+
+Start the server on Linux. Set `PYTHONPATH` so the local CosyVoice checkout can be imported. If GPU 7 is the intended TTS GPU, retain `CUDA_VISIBLE_DEVICES=7`; otherwise omit that prefix.
+
+```bash
+cd /home/xiezc/Auralis
+export PYTHONPATH=/home/xiezc/Auralis/third_party/CosyVoice:$PYTHONPATH
+CUDA_VISIBLE_DEVICES=7 python auralis_lab/ws_stream_tts_server.py --host 0.0.0.0 --port 8770 --vad-engine silero --asr-engine sherpa_onnx --llm-model qwen3:8b --tts-engine cosyvoice --cosy-mode sft
+```
+
+Run the Windows client with the selected microphone and speaker IDs:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --output-device 23 --server-url ws://192.168.16.206:8770 --seconds 90 --frame-ms 100 --blocksize-frames 0 --timeout 300
+```
+
+The server emits `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events. Reply WAV files are saved under `outputs/stream_replies/` on Windows and `outputs/ws_stream_tts_replies/` on the server.
+
+This first version is half-duplex: after the server accepts an utterance, the client closes the microphone stream before reply playback and opens it again afterwards. Playback is created on the main Windows thread because the HP21 WASAPI endpoint failed when PortAudio opened it from an asyncio worker thread. It resumes immediately when ASR/LLM/TTS produces no reply. Use headphones for the cleanest initial validation.
+
+This full loop was validated with a 48 kHz HP21 WASAPI microphone resampled continuously to 16 kHz, Silero VAD, sherpa-onnx SenseVoice, Qwen3-8B through Ollama, and CosyVoice SFT. Device IDs are assigned dynamically by Windows; use `--list-devices` rather than assuming the example IDs remain stable.

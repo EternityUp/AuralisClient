@@ -4,6 +4,8 @@ Date: 2026-06-17
 
 This milestone records the first validated end-to-end Auralis client/server voice interaction loop.
 
+> Historical record: this offline baseline remains useful for regression testing. It was superseded as the active interaction path by Milestone 02, documented in `milestone-02-streaming-half-duplex-loop.md`.
+
 ## Summary
 
 Auralis has completed the first cross-machine voice interaction milestone:

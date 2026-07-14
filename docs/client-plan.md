@@ -2,6 +2,19 @@
 
 This document tracks the Windows client implementation plan.
 
+## Current Status
+
+Milestone 02 is validated as of 2026-07-14. The Windows client can continuously capture channel 0, resample it to 16 kHz mono PCM16, send frames to the Linux server, receive utterance-level reply WAV files, and play them through the selected speaker.
+
+The current live loop is deliberately half-duplex:
+
+```text
+capture -> server accepts utterance -> close capture stream
+-> receive and play reply WAV -> reopen capture stream
+```
+
+This avoids feedback and keeps WASAPI playback on the main Windows thread. It is the stable baseline before full-duplex echo cancellation or barge-in.
+
 ## Scope
 
 The client handles Windows-side audio interaction only.
@@ -153,3 +166,40 @@ python -m auralis_client.offline_turn_loop_client --record-seconds 5 --input-dev
 ```
 
 This keeps the client alive until `Ctrl+C`. Each turn records a fixed-length utterance, waits for the server reply, plays the reply, and then starts the next recording window.
+
+### Step 6: Streaming Frame Upload Prototype
+
+Goal:
+
+```text
+client continuous mic capture
+-> supported source sample rate
+-> stateful resampling when needed
+-> 16 kHz mono PCM16 frames
+-> WebSocket binary messages
+-> server reconstructs and saves wav
+```
+
+Server command:
+
+```bash
+python auralis_lab/ws_stream_record_server.py --host 0.0.0.0 --port 8766
+```
+
+Client command:
+
+```powershell
+python -m auralis_client.stream_upload_client --input-device 26 --server-url ws://192.168.16.206:8766 --seconds 10 --frame-ms 100
+```
+
+The client first tries to capture at 16 kHz, then falls back to the device default or common desktop rates such as 48 kHz. When the source rate differs from 16 kHz, it uses a continuous streaming resampler before emitting fixed-size PCM16 frames.
+
+### Step 7: Server VAD and Streaming ASR
+
+Completed and validated with Silero VAD and `sherpa_onnx + SenseVoice`. The client remains responsible only for continuous 16 kHz PCM16 frame delivery; utterance segmentation and ASR stay on the server.
+
+### Step 8: Streaming LLM and TTS Reply Playback
+
+Completed and validated with Ollama `qwen3:8b` and persistent CosyVoice SFT. The client receives `reply_audio` metadata followed by WAV bytes, saves the WAV under `outputs/stream_replies/`, plays it, then resumes capture.
+
+See `milestone-02-streaming-half-duplex-loop.md` for the validated cross-machine protocol and current limitations.
