@@ -203,3 +203,11 @@ Completed and validated with Silero VAD and `sherpa_onnx + SenseVoice`. The clie
 Completed and validated with Ollama `qwen3:8b` and persistent CosyVoice SFT. The client receives `reply_audio` metadata followed by WAV bytes, saves the WAV under `outputs/stream_replies/`, plays it, then resumes capture.
 
 See `milestone-02-streaming-half-duplex-loop.md` for the validated cross-machine protocol and current limitations.
+
+### Step 9: Single WASAPI Duplex Stream
+
+The local HP21 hardware test passed: one `sounddevice.Stream` kept 48 kHz WASAPI capture and stereo playback active simultaneously while input was continuously converted to 16 kHz mono PCM16.
+
+`stream_upload_client.py` now adopts this engine automatically when both selected devices are WASAPI endpoints. It retains the existing interaction policy by pausing only upstream frame delivery during server processing and reply playback; the hardware Stream remains open. Use `--audio-mode separate_streams` only as a compatibility fallback.
+
+The next validation is the full server-backed loop using `--audio-mode duplex_wasapi`.

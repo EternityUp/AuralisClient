@@ -49,14 +49,16 @@ reply_audio
 
 ## Playback Policy
 
-The initial policy is half-duplex:
+The initial interaction policy is half-duplex:
 
 1. The client streams microphone frames while waiting for speech.
-2. After `turn_started`, it closes the input stream and clears queued frames.
-3. It receives and plays the completed reply WAV.
-4. It reopens the input stream after playback.
+2. After `turn_started`, it clears queued frames and pauses upstream frame delivery.
+3. It receives and plays the completed reply WAV through the already-open duplex Stream.
+4. It resumes upstream frame delivery after playback.
 
-This avoids feedback and prevents audio captured during LLM/TTS computation from being interpreted as a new utterance. It is not a claim that the HP21 hardware lacks full-duplex capability; Audacity demonstrates that the device can record and play simultaneously. The current restriction is a deliberate application policy and a PortAudio/WASAPI integration choice.
+This avoids feedback and prevents audio captured during LLM/TTS computation from being interpreted as a new utterance. It is not a claim that the HP21 hardware lacks full-duplex capability; Audacity and the local single-Stream test demonstrate that the device can record and play simultaneously. The current restriction is a deliberate application policy. The Stream remains open in the WASAPI duplex implementation, which avoids creating a second PortAudio output stream for each reply.
+
+The local device test has passed. The next required regression is the server-backed streaming loop using `--audio-mode duplex_wasapi`.
 
 ## Observed Performance
 

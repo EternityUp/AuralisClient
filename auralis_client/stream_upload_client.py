@@ -7,9 +7,16 @@ import time
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event
-from typing import Callable
+from typing import Awaitable, Callable
 
-from auralis_client.audio_io import choose_devices_interactively, create_first_channel_pcm16_input_stream, play_wav
+import sounddevice as sd
+
+from auralis_client.audio_io import (
+    DuplexAudioEngine,
+    choose_devices_interactively,
+    create_first_channel_pcm16_input_stream,
+    play_wav,
+)
 from auralis_client.config import CLIENT_SAMPLE_RATE
 
 
@@ -21,15 +28,23 @@ def clear_frame_queue(frame_queue: Queue[bytes]) -> None:
             return
 
 
+def is_wasapi_duplex_pair(input_device: int, output_device: int) -> bool:
+    input_info = sd.query_devices(input_device, "input")
+    output_info = sd.query_devices(output_device, "output")
+    input_hostapi = sd.query_hostapis(int(input_info["hostapi"]))
+    output_hostapi = sd.query_hostapis(int(output_info["hostapi"]))
+    return input_hostapi["name"] == "Windows WASAPI" and output_hostapi["name"] == "Windows WASAPI"
+
+
 async def handle_server_message(
     websocket,
     message: str | bytes,
     args: argparse.Namespace,
     frame_queue: Queue[bytes],
-    capture_paused: Event,
     server_events: list[str],
-    stop_capture: Callable[[], None],
-    start_capture: Callable[[], None],
+    pause_uplink: Callable[[], None],
+    resume_uplink: Callable[[], None],
+    play_reply_audio: Callable[[Path], Awaitable[None]],
 ) -> str | None:
     if isinstance(message, bytes):
         print(f"Unexpected binary server message: {len(message)} bytes")
@@ -42,16 +57,14 @@ async def handle_server_message(
     message_type = payload.get("type")
 
     if message_type == "turn_started":
-        capture_paused.set()
+        pause_uplink()
         clear_frame_queue(frame_queue)
-        stop_capture()
-        print("Server accepted an utterance; microphone capture paused for this reply.")
+        print("Server accepted an utterance; upstream microphone frames paused for this reply.")
     elif message_type in {"asr_filtered", "llm_error", "llm_filtered", "tts_error"}:
         # No reply audio will follow, so allow the next utterance immediately.
         clear_frame_queue(frame_queue)
-        capture_paused.clear()
-        start_capture()
-        print("No reply audio for this utterance; microphone capture resumed.")
+        resume_uplink()
+        print("No reply audio for this utterance; microphone uplink resumed.")
 
     if message_type != "reply_audio":
         server_events.append(message)
@@ -72,25 +85,13 @@ async def handle_server_message(
     print(message)
     print(f"REPLY_AUDIO_OUTPUT: {reply_path}")
 
-    if args.output_device is not None:
-        capture_paused.set()
+    pause_uplink()
+    try:
+        await play_reply_audio(reply_path)
+    finally:
         clear_frame_queue(frame_queue)
-        print("Playing reply audio...")
-        try:
-            # Keep Windows WASAPI stream creation on the main client thread.
-            # The offline client uses the same synchronous path and some USB
-            # drivers fail when PortAudio opens their output endpoint from an
-            # asyncio worker thread.
-            play_wav(reply_path, args.output_device)
-        finally:
-            clear_frame_queue(frame_queue)
-            capture_paused.clear()
-            start_capture()
-        print("Reply playback done.")
-    else:
-        clear_frame_queue(frame_queue)
-        capture_paused.clear()
-        start_capture()
+        resume_uplink()
+    print("Reply playback done.")
     return message_type
 
 
@@ -109,11 +110,24 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
             output_device = selected_output
     args.output_device = output_device
 
+    if args.audio_mode == "duplex_wasapi":
+        if output_device is None:
+            raise SystemExit("--audio-mode duplex_wasapi requires --output-device.")
+        use_duplex = True
+    elif args.audio_mode == "auto":
+        use_duplex = output_device is not None and is_wasapi_duplex_pair(input_device, output_device)
+    else:
+        use_duplex = False
+    if use_duplex:
+        print("AUDIO_MODE: duplex_wasapi")
+    else:
+        print("AUDIO_MODE: separate_streams")
+
     frame_queue: Queue[bytes] = Queue()
-    capture_paused = Event()
+    uplink_paused = Event()
 
     def on_frame(frame: bytes) -> None:
-        if not capture_paused.is_set():
+        if not uplink_paused.is_set():
             frame_queue.put(frame)
 
     metadata = {
@@ -131,11 +145,28 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
     server_events: list[str] = []
     started = time.perf_counter()
     capture_stream = None
+    duplex_engine: DuplexAudioEngine | None = None
     capture_resumable = True
+
+    if use_duplex:
+        assert output_device is not None
+        duplex_engine = DuplexAudioEngine(
+            input_device=input_device,
+            output_device=output_device,
+            input_frame_callback=on_frame,
+            frame_duration_ms=args.frame_ms,
+            blocksize_frames=args.blocksize_frames,
+            latency=args.duplex_latency,
+        )
 
     def start_capture() -> None:
         nonlocal capture_stream
-        if not capture_resumable or capture_stream is not None:
+        if not capture_resumable:
+            return
+        if duplex_engine is not None:
+            duplex_engine.start()
+            return
+        if capture_stream is not None:
             return
         stream = create_first_channel_pcm16_input_stream(
             input_device,
@@ -152,6 +183,9 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
 
     def stop_capture() -> None:
         nonlocal capture_stream
+        if duplex_engine is not None:
+            duplex_engine.stop()
+            return
         if capture_stream is None:
             return
         try:
@@ -159,6 +193,35 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
         finally:
             capture_stream.close()
             capture_stream = None
+
+    def pause_uplink() -> None:
+        uplink_paused.set()
+        clear_frame_queue(frame_queue)
+        if duplex_engine is None:
+            stop_capture()
+
+    def resume_uplink() -> None:
+        clear_frame_queue(frame_queue)
+        if not capture_resumable:
+            return
+        uplink_paused.clear()
+        if duplex_engine is None:
+            start_capture()
+
+    async def play_reply_audio(reply_path: Path) -> None:
+        if duplex_engine is None:
+            if output_device is None:
+                return
+            print("Playing reply audio through a separate output stream...")
+            # Keep Windows WASAPI stream creation on the main client thread.
+            play_wav(reply_path, output_device)
+            return
+
+        print("Playing reply audio through the persistent duplex stream...")
+        completion = duplex_engine.enqueue_wav(reply_path)
+        await asyncio.wait_for(asyncio.to_thread(completion.wait), timeout=args.timeout)
+        for status in duplex_engine.drain_status():
+            print(status)
 
     async with websockets.connect(args.server_url, open_timeout=args.timeout, max_size=None) as websocket:
         await websocket.send(json.dumps(metadata, ensure_ascii=False))
@@ -174,12 +237,14 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
                 try:
                     frame = frame_queue.get(timeout=0.2)
                 except Empty:
-                    # In half-duplex mode the microphone stream is closed
-                    # while the server runs LLM/TTS. Keep receiving server
-                    # events instead of waiting forever for a new frame.
+                    # During reply generation/playback the duplex stream stays
+                    # open, but its input frames are intentionally not sent.
                     try:
                         event = await asyncio.wait_for(websocket.recv(), timeout=0.05)
                     except asyncio.TimeoutError:
+                        if duplex_engine is not None:
+                            for status in duplex_engine.drain_status():
+                                print(status)
                         await asyncio.sleep(0)
                     else:
                         await handle_server_message(
@@ -187,10 +252,10 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
                             event,
                             args,
                             frame_queue,
-                            capture_paused,
                             server_events,
-                            stop_capture,
-                            start_capture,
+                            pause_uplink,
+                            resume_uplink,
+                            play_reply_audio,
                         )
                     continue
                 await websocket.send(frame)
@@ -206,73 +271,79 @@ async def run_stream_upload(args: argparse.Namespace) -> None:
                         event,
                         args,
                         frame_queue,
-                        capture_paused,
                         server_events,
-                        stop_capture,
-                        start_capture,
+                        pause_uplink,
+                        resume_uplink,
+                        play_reply_audio,
                     )
         except KeyboardInterrupt:
             print()
             print("Stopping stream by user request...")
         finally:
             capture_resumable = False
-            stop_capture()
+            uplink_paused.set()
+            clear_frame_queue(frame_queue)
+            if duplex_engine is None:
+                stop_capture()
 
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "stream_stop",
-                    "client_time": time.time(),
-                    "frames": frame_count,
-                    "bytes": byte_count,
-                },
-                ensure_ascii=False,
+        try:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "stream_stop",
+                        "client_time": time.time(),
+                        "frames": frame_count,
+                        "bytes": byte_count,
+                    },
+                    ensure_ascii=False,
+                )
             )
-        )
-        ack = None
-        while ack is None:
-            event = await asyncio.wait_for(websocket.recv(), timeout=args.timeout)
-            if isinstance(event, str):
-                try:
-                    event_type = json.loads(event).get("type")
-                except Exception:
+            ack = None
+            while ack is None:
+                event = await asyncio.wait_for(websocket.recv(), timeout=args.timeout)
+                if isinstance(event, str):
+                    try:
+                        event_type = json.loads(event).get("type")
+                    except Exception:
+                        event_type = None
+                else:
                     event_type = None
-            else:
-                event_type = None
-            if event_type in (
-                "stream_saved",
-                "stream_vad_stopped",
-                "stream_asr_stopped",
-                "stream_llm_stopped",
-                "stream_tts_stopped",
-            ):
-                ack = event
-            else:
+                if event_type in (
+                    "stream_saved",
+                    "stream_vad_stopped",
+                    "stream_asr_stopped",
+                    "stream_llm_stopped",
+                    "stream_tts_stopped",
+                ):
+                    ack = event
+                else:
+                    await handle_server_message(
+                        websocket,
+                        event,
+                        args,
+                        frame_queue,
+                        server_events,
+                        pause_uplink,
+                        resume_uplink,
+                        play_reply_audio,
+                    )
+            while True:
+                try:
+                    event = await asyncio.wait_for(websocket.recv(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    break
                 await handle_server_message(
                     websocket,
                     event,
                     args,
                     frame_queue,
-                    capture_paused,
                     server_events,
-                    stop_capture,
-                    start_capture,
+                    pause_uplink,
+                    resume_uplink,
+                    play_reply_audio,
                 )
-        while True:
-            try:
-                event = await asyncio.wait_for(websocket.recv(), timeout=0.05)
-            except asyncio.TimeoutError:
-                break
-            await handle_server_message(
-                websocket,
-                event,
-                args,
-                frame_queue,
-                capture_paused,
-                server_events,
-                stop_capture,
-                start_capture,
-            )
+        finally:
+            stop_capture()
 
     elapsed = time.perf_counter() - started
     print("STREAM_ACK:")
@@ -295,7 +366,19 @@ def main() -> None:
         "--blocksize-frames",
         type=int,
         default=None,
-        help="InputStream blocksize in frames. Use 0 to let PortAudio choose automatically.",
+        help="Audio stream blocksize in frames. Use 0 to let PortAudio choose automatically.",
+    )
+    parser.add_argument(
+        "--audio-mode",
+        choices=["auto", "duplex_wasapi", "separate_streams"],
+        default="auto",
+        help="auto uses one WASAPI duplex stream when both selected devices are WASAPI endpoints.",
+    )
+    parser.add_argument(
+        "--duplex-latency",
+        choices=["low", "high"],
+        default="high",
+        help="Requested PortAudio latency for the WASAPI duplex stream.",
     )
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()

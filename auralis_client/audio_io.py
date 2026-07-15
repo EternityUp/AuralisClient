@@ -502,6 +502,49 @@ def choose_playback_channels(device: int | None, source_channels: int) -> int:
     return 1
 
 
+def choose_duplex_sample_rate(
+    input_device: int,
+    output_device: int,
+    input_channels: int,
+    output_channels: int,
+) -> int:
+    input_info = sd.query_devices(input_device, "input")
+    output_info = sd.query_devices(output_device, "output")
+    candidates = unique_sample_rates(
+        [
+            int(input_info["default_samplerate"]),
+            int(output_info["default_samplerate"]),
+            48000,
+            44100,
+            32000,
+            24000,
+            16000,
+        ]
+    )
+    last_error: Exception | None = None
+    for sample_rate in candidates:
+        try:
+            sd.check_input_settings(
+                device=input_device,
+                samplerate=sample_rate,
+                channels=input_channels,
+                dtype="float32",
+            )
+            sd.check_output_settings(
+                device=output_device,
+                samplerate=sample_rate,
+                channels=output_channels,
+                dtype="float32",
+            )
+            return sample_rate
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        "No shared sample rate found for the selected duplex input/output devices. "
+        f"Tried: {candidates}. Last error: {last_error}"
+    )
+
+
 def adapt_playback_channels(audio: np.ndarray, target_channels: int) -> np.ndarray:
     audio = np.asarray(audio, dtype="float32")
     if audio.ndim == 1:
@@ -532,6 +575,187 @@ def add_playback_guard_silence(
     head = np.zeros(head_shape, dtype="float32")
     tail = np.zeros(tail_shape, dtype="float32")
     return np.concatenate([head, audio.astype("float32"), tail])
+
+
+class DuplexAudioEngine:
+    """Keep a single WASAPI Stream open for microphone capture and playback.
+
+    The audio callback only moves already-prepared audio between memory queues.
+    File I/O, resampling for playback, WebSocket operations, and model work
+    must remain outside this class's callback.
+    """
+
+    def __init__(
+        self,
+        input_device: int,
+        output_device: int,
+        input_frame_callback: Callable[[bytes], None],
+        frame_duration_ms: int = 100,
+        blocksize_frames: int | None = 0,
+        latency: str = "high",
+        require_wasapi: bool = True,
+    ) -> None:
+        self.input_device = input_device
+        self.output_device = output_device
+        self.input_frame_callback = input_frame_callback
+        self.frame_duration_ms = frame_duration_ms
+        self.latency = latency
+
+        input_info = sd.query_devices(input_device, "input")
+        output_info = sd.query_devices(output_device, "output")
+        self.input_channels = 1
+        self.output_channels = 2 if int(output_info["max_output_channels"]) >= 2 else 1
+        if int(input_info["max_input_channels"]) < self.input_channels:
+            raise RuntimeError(f"Input device {input_device} does not expose a microphone channel.")
+        if int(output_info["max_output_channels"]) < self.output_channels:
+            raise RuntimeError(f"Output device {output_device} does not expose enough playback channels.")
+
+        input_hostapi = sd.query_hostapis(int(input_info["hostapi"]))
+        output_hostapi = sd.query_hostapis(int(output_info["hostapi"]))
+        self.input_hostapi_name = str(input_hostapi["name"])
+        self.output_hostapi_name = str(output_hostapi["name"])
+        if require_wasapi and (
+            self.input_hostapi_name != "Windows WASAPI" or self.output_hostapi_name != "Windows WASAPI"
+        ):
+            raise RuntimeError(
+                "DuplexAudioEngine requires both devices to use Windows WASAPI. "
+                f"Input uses {self.input_hostapi_name}; output uses {self.output_hostapi_name}."
+            )
+
+        self.sample_rate = choose_duplex_sample_rate(
+            input_device,
+            output_device,
+            self.input_channels,
+            self.output_channels,
+        )
+        self.blocksize = 0 if blocksize_frames is None else max(0, blocksize_frames)
+        self.frame_sample_count = max(1, int(CLIENT_SAMPLE_RATE * frame_duration_ms / 1000))
+        self.resampler = StreamingResampler(self.sample_rate, CLIENT_SAMPLE_RATE)
+        self.frame_emitter = Pcm16FrameEmitter(input_frame_callback, self.frame_sample_count)
+        self.playback_queue: Queue[tuple[np.ndarray, Event]] = Queue()
+        self.status_queue: Queue[str] = Queue()
+        self._active_playback: tuple[np.ndarray, Event] | None = None
+        self._active_playback_offset = 0
+        self._stream: sd.Stream | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._stream is not None and bool(self._stream.active)
+
+    def start(self) -> None:
+        if self._stream is not None:
+            return
+        print(
+            f"Opening duplex stream: input {self.input_device} ({self.input_hostapi_name}), "
+            f"output {self.output_device} ({self.output_hostapi_name}), "
+            f"{self.sample_rate} Hz, {self.input_channels} in / {self.output_channels} out, "
+            f"blocksize={self.blocksize}, latency={self.latency}"
+        )
+        stream = sd.Stream(
+            device=(self.input_device, self.output_device),
+            samplerate=self.sample_rate,
+            blocksize=self.blocksize,
+            channels=(self.input_channels, self.output_channels),
+            dtype="float32",
+            latency=self.latency,
+            callback=self._callback,
+        )
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        self._stream = stream
+
+    def stop(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            finally:
+                self._stream.close()
+                self._stream = None
+        while True:
+            try:
+                _, completion = self.playback_queue.get_nowait()
+            except Empty:
+                break
+            completion.set()
+        if self._active_playback is not None:
+            self._active_playback[1].set()
+            self._active_playback = None
+            self._active_playback_offset = 0
+
+    def enqueue_wav(
+        self,
+        path: str | Path,
+        head_silence_ms: int = 1000,
+        tail_silence_ms: int = 300,
+    ) -> Event:
+        audio, source_sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
+        source_channels = 1 if audio.ndim == 1 else int(audio.shape[1])
+        audio = resample_audio(audio, int(source_sample_rate), self.sample_rate)
+        audio = adapt_playback_channels(audio, self.output_channels)
+        audio = add_playback_guard_silence(audio, self.sample_rate, head_silence_ms, tail_silence_ms)
+        print(
+            f"Queued duplex playback: {Path(path).name}, {int(source_sample_rate)} Hz -> {self.sample_rate} Hz, "
+            f"{source_channels} -> {self.output_channels} channel(s), "
+            f"guard {head_silence_ms}/{tail_silence_ms} ms"
+        )
+        return self.enqueue_playback(audio)
+
+    def enqueue_playback(self, audio: np.ndarray) -> Event:
+        completion = Event()
+        prepared = np.ascontiguousarray(adapt_playback_channels(audio, self.output_channels), dtype="float32")
+        if prepared.size == 0:
+            completion.set()
+            return completion
+        self.playback_queue.put((prepared, completion))
+        return completion
+
+    def drain_status(self) -> list[str]:
+        statuses: list[str] = []
+        while True:
+            try:
+                statuses.append(self.status_queue.get_nowait())
+            except Empty:
+                return statuses
+
+    def _callback(
+        self,
+        indata: np.ndarray,
+        outdata: np.ndarray,
+        frames: int,
+        time_info: object,
+        status: sd.CallbackFlags,
+    ) -> None:
+        if status:
+            self.status_queue.put(f"Duplex stream status: {status}")
+
+        input_audio = indata[:, 0].copy()
+        self.frame_emitter.push(self.resampler.process(input_audio))
+
+        outdata.fill(0.0)
+        output_offset = 0
+        while output_offset < frames:
+            if self._active_playback is None:
+                try:
+                    self._active_playback = self.playback_queue.get_nowait()
+                    self._active_playback_offset = 0
+                except Empty:
+                    return
+
+            playback, completion = self._active_playback
+            available = playback.shape[0] - self._active_playback_offset
+            samples = min(frames - output_offset, available)
+            outdata[output_offset : output_offset + samples, :] = playback[
+                self._active_playback_offset : self._active_playback_offset + samples, :
+            ]
+            output_offset += samples
+            self._active_playback_offset += samples
+            if self._active_playback_offset >= playback.shape[0]:
+                completion.set()
+                self._active_playback = None
+                self._active_playback_offset = 0
 
 
 def play_wav(

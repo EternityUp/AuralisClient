@@ -294,6 +294,20 @@ python -m auralis_client.stream_upload_client --input-device 26 --output-device 
 
 The server emits `turn_started`, `utterance_saved`, `asr_result`, `llm_result`, `tts_result`, and `reply_audio` events. Reply WAV files are saved under `outputs/stream_replies/` on Windows and `outputs/ws_stream_tts_replies/` on the server.
 
-This first version is half-duplex: after the server accepts an utterance, the client closes the microphone stream before reply playback and opens it again afterwards. Playback is created on the main Windows thread because the HP21 WASAPI endpoint failed when PortAudio opened it from an asyncio worker thread. It resumes immediately when ASR/LLM/TTS produces no reply. Use headphones for the cleanest initial validation.
+This first version is logically half-duplex: after the server accepts an utterance, the client pauses upstream microphone frames until reply playback completes. With WASAPI input/output endpoints, `--audio-mode auto` keeps one full-duplex device Stream open; it does not reopen a second PortAudio output stream for every reply. Non-WASAPI device pairs fall back to the older separate-stream path. The client resumes immediately when ASR/LLM/TTS produces no reply. Use headphones for the cleanest initial validation.
 
 This full loop was validated with a 48 kHz HP21 WASAPI microphone resampled continuously to 16 kHz, Silero VAD, sherpa-onnx SenseVoice, Qwen3-8B through Ollama, and CosyVoice SFT. Device IDs are assigned dynamically by Windows; use `--list-devices` rather than assuming the example IDs remain stable.
+
+To explicitly require the new HP21 single-Stream path during validation, add `--audio-mode duplex_wasapi --duplex-latency high` to the streaming client command. `auto` selects it when both selected devices belong to Windows WASAPI.
+
+## Experimental WASAPI Duplex Stream Test
+
+The next audio-I/O step keeps one WASAPI full-duplex stream open for HP21 microphone capture and speaker playback. This test does not connect to the server; it validates the device layer before the WebSocket client is changed.
+
+Use an existing reply WAV from `outputs/stream_replies/` as `--play-wav`:
+
+```powershell
+python -m auralis_client.duplex_stream_test --input-device 21 --output-device 16 --play-wav outputs/stream_replies/<reply-file>.wav --seconds 30 --frame-ms 100 --blocksize-frames 0 --latency high
+```
+
+The test keeps a single `sounddevice.Stream` open at a shared device rate, normally 48 kHz for HP21. It continuously saves channel-0 microphone audio as 16 kHz mono PCM16 under `outputs/duplex-stream-input-16k.wav`, while it injects the selected reply WAV through the same Stream's output side. Successful hardware validation requires clean simultaneous capture and playback with no PortAudio error.
