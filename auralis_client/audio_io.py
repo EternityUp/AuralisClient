@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from math import gcd
 from queue import Empty, Queue
-from threading import Event
+from threading import Event, Lock
 from typing import Callable
 
 import numpy as np
@@ -634,6 +634,7 @@ class DuplexAudioEngine:
         self.frame_emitter = Pcm16FrameEmitter(input_frame_callback, self.frame_sample_count)
         self.playback_queue: Queue[tuple[np.ndarray, Event]] = Queue()
         self.status_queue: Queue[str] = Queue()
+        self._playback_lock = Lock()
         self._active_playback: tuple[np.ndarray, Event] | None = None
         self._active_playback_offset = 0
         self._stream: sd.Stream | None = None
@@ -674,16 +675,30 @@ class DuplexAudioEngine:
             finally:
                 self._stream.close()
                 self._stream = None
+        self.clear_playback()
+
+    def clear_playback(self) -> int:
+        """Immediately discard queued and active playback from the duplex callback.
+
+        The callback and the asyncio/WebSocket thread share playback state, so
+        the active buffer is protected separately from Queue's internal lock.
+        Completion events are released to unblock playback waiters.
+        """
+        cleared = 0
         while True:
             try:
                 _, completion = self.playback_queue.get_nowait()
             except Empty:
                 break
             completion.set()
-        if self._active_playback is not None:
-            self._active_playback[1].set()
-            self._active_playback = None
-            self._active_playback_offset = 0
+            cleared += 1
+        with self._playback_lock:
+            if self._active_playback is not None:
+                self._active_playback[1].set()
+                self._active_playback = None
+                self._active_playback_offset = 0
+                cleared += 1
+        return cleared
 
     def enqueue_wav(
         self,
@@ -735,27 +750,28 @@ class DuplexAudioEngine:
         self.frame_emitter.push(self.resampler.process(input_audio))
 
         outdata.fill(0.0)
-        output_offset = 0
-        while output_offset < frames:
-            if self._active_playback is None:
-                try:
-                    self._active_playback = self.playback_queue.get_nowait()
-                    self._active_playback_offset = 0
-                except Empty:
-                    return
+        with self._playback_lock:
+            output_offset = 0
+            while output_offset < frames:
+                if self._active_playback is None:
+                    try:
+                        self._active_playback = self.playback_queue.get_nowait()
+                        self._active_playback_offset = 0
+                    except Empty:
+                        return
 
-            playback, completion = self._active_playback
-            available = playback.shape[0] - self._active_playback_offset
-            samples = min(frames - output_offset, available)
-            outdata[output_offset : output_offset + samples, :] = playback[
-                self._active_playback_offset : self._active_playback_offset + samples, :
-            ]
-            output_offset += samples
-            self._active_playback_offset += samples
-            if self._active_playback_offset >= playback.shape[0]:
-                completion.set()
-                self._active_playback = None
-                self._active_playback_offset = 0
+                playback, completion = self._active_playback
+                available = playback.shape[0] - self._active_playback_offset
+                samples = min(frames - output_offset, available)
+                outdata[output_offset : output_offset + samples, :] = playback[
+                    self._active_playback_offset : self._active_playback_offset + samples, :
+                ]
+                output_offset += samples
+                self._active_playback_offset += samples
+                if self._active_playback_offset >= playback.shape[0]:
+                    completion.set()
+                    self._active_playback = None
+                    self._active_playback_offset = 0
 
 
 def play_wav(

@@ -210,4 +210,12 @@ The local HP21 hardware test passed: one `sounddevice.Stream` kept 48 kHz WASAPI
 
 `stream_upload_client.py` now adopts this engine automatically when both selected devices are WASAPI endpoints. It retains the existing interaction policy by pausing only upstream frame delivery during server processing and reply playback; the hardware Stream remains open. Use `--audio-mode separate_streams` only as a compatibility fallback.
 
-The next validation is the full server-backed loop using `--audio-mode duplex_wasapi`.
+The server-backed loop has been validated with `--audio-mode duplex_wasapi` on the HP21 WASAPI device pair.
+
+### Step 10: Continuous Uplink and LLM-Confirmed Barge-In
+
+`realtime_bargein_client.py` is a separate validated client for the continuous-uplink interaction stage. It requires a WASAPI input/output pair and keeps the single duplex Stream open while reply audio plays.
+
+Unlike the Milestone 02 client, it never pauses upstream microphone frames. It accepts `barge_in` only after the server performs VAD endpointing, ASR filtering, and a short LLM classification. A confirmed event clears local playback through `DuplexAudioEngine.clear_playback()` and the user utterance becomes the next turn.
+
+The server-backed validation with the HP21 WASAPI pair confirmed both cases: a short acknowledgement does not interrupt, while a real question or stop command interrupts the reply. On normal `--seconds` expiry, capture stops first and any reply WAV already received drains before the duplex Stream closes; `Ctrl+C` remains an immediate-stop path.

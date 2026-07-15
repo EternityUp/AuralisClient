@@ -300,9 +300,9 @@ This full loop was validated with a 48 kHz HP21 WASAPI microphone resampled cont
 
 To explicitly require the new HP21 single-Stream path during validation, add `--audio-mode duplex_wasapi --duplex-latency high` to the streaming client command. `auto` selects it when both selected devices belong to Windows WASAPI.
 
-## Experimental WASAPI Duplex Stream Test
+## WASAPI Duplex Stream Validation
 
-The next audio-I/O step keeps one WASAPI full-duplex stream open for HP21 microphone capture and speaker playback. This test does not connect to the server; it validates the device layer before the WebSocket client is changed.
+The local HP21 hardware validation passed: one WASAPI full-duplex stream remains open for microphone capture and speaker playback. This standalone test remains useful as a device-layer regression check before investigating server-side behavior.
 
 Use an existing reply WAV from `outputs/stream_replies/` as `--play-wav`:
 
@@ -310,4 +310,26 @@ Use an existing reply WAV from `outputs/stream_replies/` as `--play-wav`:
 python -m auralis_client.duplex_stream_test --input-device 21 --output-device 16 --play-wav outputs/stream_replies/<reply-file>.wav --seconds 30 --frame-ms 100 --blocksize-frames 0 --latency high
 ```
 
-The test keeps a single `sounddevice.Stream` open at a shared device rate, normally 48 kHz for HP21. It continuously saves channel-0 microphone audio as 16 kHz mono PCM16 under `outputs/duplex-stream-input-16k.wav`, while it injects the selected reply WAV through the same Stream's output side. Successful hardware validation requires clean simultaneous capture and playback with no PortAudio error.
+The test keeps a single `sounddevice.Stream` open at a shared device rate, normally 48 kHz for HP21. It continuously saves channel-0 microphone audio as 16 kHz mono PCM16 under `outputs/duplex-stream-input-16k.wav`, while it injects the selected reply WAV through the same Stream's output side. The validated result is clean simultaneous capture and playback with no PortAudio error.
+
+## Realtime Barge-In Validation
+
+`realtime_bargein_client.py` is separate from the retained Milestone 02 half-duplex client. It has been validated with the HP21 WASAPI duplex Stream: microphone frames continue uploading while reply audio is playing.
+
+The server does not interrupt playback on a raw VAD trigger. Its decision path is:
+
+```text
+VAD endpoint -> ASR and noise filter -> short LLM classifier -> barge_in or continue/ignore
+```
+
+Run it only with Windows WASAPI input/output device IDs:
+
+```powershell
+python -m auralis_client.realtime_bargein_client --input-device 21 --output-device 16 --server-url ws://192.168.16.206:8771 --seconds 120 --frame-ms 100 --blocksize-frames 0 --duplex-latency high --timeout 300
+```
+
+On `barge_in`, the client clears its active reply buffer immediately and continues sending microphone frames. The server then treats the validated user speech as the next conversational turn. The validation covered normal replies, acknowledgement speech that must continue playback, explicit interruption that must clear playback, and clean session shutdown.
+
+This remains an utterance-level interaction path: it does not yet stream partial ASR, LLM tokens, or TTS audio chunks.
+
+`--seconds` limits microphone capture time. When that timer expires, the client stops capture and waits for any reply WAV already received to finish playing before it closes the duplex Stream. `Ctrl+C` is the explicit immediate-stop path and clears pending local playback.
